@@ -1,88 +1,79 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from openai import AsyncOpenAI
 import os
+from typing import List
 from dotenv import load_dotenv
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
+from pydantic import BaseModel
+
+from langchain.chains import RetrievalQA
+from langchain_pinecone import PineconeVectorStore
+from langchain_upstage import UpstageEmbeddings
+from pinecone import Pinecone, ServerlessSpec
+from openai import OpenAI
 
 load_dotenv()
-openai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# Initialize FastAPI
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"]
 )
 
+# LangChain + Pinecone Setup
+embedding_model = UpstageEmbeddings(model="embedding-query")
+pinecone = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+index_name = "manual-qa-index"
+vectorstore = PineconeVectorStore(index=pinecone.Index(index_name), embedding=embedding_model)
+retriever = vectorstore.as_retriever(search_type='mmr', search_kwargs={"k": 2})
+
+# OpenAI API Client
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# ==== Request/Response Models ====
 
 class ChatMessage(BaseModel):
-    role: str
+    role: str  # 'user' or 'assistant'
     content: str
 
-
-class AssistantRequest(BaseModel):
-    message: str
-    thread_id: Optional[str] = None
-
-
 class ChatRequest(BaseModel):
-    messages: List[ChatMessage]  # Entire conversation for naive mode
+    messages: List[ChatMessage]  # entire conversation so far
 
+
+# ==== Main Chat Endpoint ====
 
 @app.post("/chat")
-async def chat_endpoint(req: ChatRequest):
-    # Assume the entire conversation (including a system message) is sent by the client.
-    # Example: messages might look like:
-    # [{"role":"system","content":"You are a helpful assistant."}, {"role":"user","content":"Hello"}]
+async def chat_with_rag(req: ChatRequest):
+    # 최신 사용자 질문
+    user_question = req.messages[-1].content
 
-    response = await openai.chat.completions.create(
-        model="gpt-4o-mini", messages=req.messages
-    )
-    assistant_reply = response.choices[0].message.content
-    return {"reply": assistant_reply}
+    # Pinecone에서 context 검색
+    docs = retriever.get_relevant_documents(user_question)
+    context_text = "\n\n".join([doc.page_content for doc in docs])
 
+    # system 프롬프트 포함 전체 메시지 구성
+    messages = [{"role": "system", "content": "You are a helpful assistant."}]
+    for m in req.messages:
+        messages.append({"role": m.role, "content": m.content})
+    messages.append({
+        "role": "system",
+        "content": f"참고 문서 내용:\n{context_text}"
+    })
 
-@app.post("/assistant")
-async def assistant_endpoint(req: AssistantRequest):
-    assistant = await openai.beta.assistants.retrieve(os.getenv("ASSISTANT_API"))
-
-    if req.thread_id:
-        # We have an existing thread, append user message
-        await openai.beta.threads.messages.create(
-            thread_id=req.thread_id, role="user", content=req.message
-        )
-        thread_id = req.thread_id
-    else:
-        # Create a new thread with user message
-        thread = await openai.beta.threads.create(
-            messages=[{"role": "user", "content": req.message}]
-        )
-        thread_id = thread.id
-
-    # Run and wait until complete
-    await openai.beta.threads.runs.create_and_poll(
-        thread_id=thread_id, assistant_id=assistant.id
+    # OpenAI Chat API 호출
+    response = openai_client.chat.completions.create(
+        model="gpt-4",
+        messages=messages,
     )
 
-    # Now retrieve messages for this thread
-    # messages.list returns an async iterator, so let's gather them into a list
-    all_messages = [
-        m async for m in openai.beta.threads.messages.list(thread_id=thread_id)
-    ]
-    print(all_messages)
+    return {"reply": response.choices[0].message.content}
 
-    # The assistant's reply should be the last message with role=assistant
-    assistant_reply = all_messages[0].content[0].text.value
-
-    return {"reply": assistant_reply, "thread_id": thread_id}
-
+@app.get("/")
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
